@@ -41,6 +41,10 @@ def web():
     from config import ModelConfig
     from model import GPT
     from tokenizers import Tokenizer
+    from hybrid_graphrag import HybridGraphRAG
+    from guardrail import get_default_guardrail
+    from primekg_loader import get_primekg_instance
+    from vector_store import get_default_vector_engine
 
     vol.reload()
     ck = torch.load(CKPT, map_location="cuda")
@@ -139,5 +143,77 @@ def web():
         return {"answer": ans, "grounded": True,
                 "sources": [{"text": h["text"][:300], "source": h["source"], "score": round(h["score"], 3)}
                             for h in hits]}
+
+    # Initialize Neurosymbolic Hybrid GraphRAG & Guardrail Engine
+    ns_guardrail = get_default_guardrail()
+    ns_hybrid_rag = HybridGraphRAG(guardrail=ns_guardrail)
+
+    @api.post("/grounded_qa")
+    def grounded_qa(body: dict):
+        """
+        Neurosymbolic Hybrid GraphRAG endpoint.
+        Combines symbolic PrimeKG multi-hop pathfinding with dense vector retrieval
+        and applies deterministic safety guardrails.
+        """
+        q = (body.get("question") or body.get("prompt") or "").strip()
+        if not q:
+            return {"answer": "", "grounded": False, "confidence": 0.0}
+
+        # 1. Run Hybrid GraphRAG
+        result = ns_hybrid_rag.query(q)
+        
+        # 2. Check Guardrail Decision
+        if result["decision"] == "BLOCKED":
+            return {
+                "answer": result["guardrail_audit"]["safe_response"],
+                "decision": "BLOCKED",
+                "grounded": True,
+                "confidence": 0.0,
+                "guardrail_audit": result["guardrail_audit"],
+                "graph_hops": result["graph_hops"]
+            }
+            
+        if result["decision"] == "REFUSED_INSUFFICIENT_EVIDENCE":
+            return {
+                "answer": result["guardrail_audit"]["safe_response"],
+                "decision": "REFUSED_INSUFFICIENT_EVIDENCE",
+                "grounded": False,
+                "confidence": result["confidence"],
+                "graph_hops": result["graph_hops"]
+            }
+
+        # 3. Neural Transformer Synthesis (Grounding conditioned on fused prompt)
+        fused_prompt = result["fused_prompt"]
+        ans = chat(fused_prompt, max_new_tokens=int(body.get("max_new_tokens", 180)), temperature=0.4)
+        
+        # 4. Post-generation Safety Re-Check on Model Output
+        final_audit = ns_guardrail.audit_clinical_response(
+            drug_name=result["linked_entities"][0] if result["linked_entities"] else "Unknown",
+            user_query=q,
+            proposed_response=ans,
+            graph_path_found=result["graph_hops"] > 0
+        )
+        if final_audit["decision"] == "BLOCKED":
+            ans = final_audit["safe_response"]
+
+        return {
+            "answer": ans,
+            "decision": final_audit["decision"],
+            "grounded": True,
+            "confidence": result["confidence"],
+            "graph_hops": result["graph_hops"],
+            "passages_retrieved": result["passages_retrieved"],
+            "conflicts": result.get("conflicts", [])
+        }
+
+    @api.post("/safety_audit")
+    def safety_audit(body: dict):
+        """Standalone API for validating drug dosages and contraindications."""
+        drug = (body.get("drug") or "").strip()
+        text = (body.get("text") or "").strip()
+        return {
+            "dosage_audit": ns_guardrail.validate_dosage(drug, text),
+            "contraindication_audit": ns_guardrail.check_contraindications(drug, text)
+        }
 
     return api
